@@ -29,8 +29,7 @@ def token_df(series: pd.Series) -> Counter:
 
 def _rare(tokens, df, k):
     toks = [t for t in set(tokens) if len(t) >= NAME_MIN_LEN and not t.isdigit()]
-    # tokens never seen in S1 can't lead to a match (typos) -> use them last
-    toks.sort(key=lambda t: (df.get(t, 0) == 0, df.get(t, 0), t))
+    toks.sort(key=lambda t: (df.get(t, 0), t))
     return toks[:k]
 
 
@@ -40,81 +39,38 @@ def _nums(nums_str, k=2):
     return ns[:k]
 
 
-def make_dfs(p1: pd.DataFrame):
-    """Token frequencies (from S1) used to pick the rarest = most informative tokens."""
-    return token_df(p1["name_core"]), token_df(p1["name_skel"]), token_df(p1["addr_sorted"])
-
-
-def isin_sorted(x: np.ndarray, sorted_vals: np.ndarray) -> np.ndarray:
-    """Memory-light np.isin when `sorted_vals` is sorted and unique."""
-    if len(sorted_vals) == 0:
-        return np.zeros(len(x), dtype=bool)
-    idx = np.searchsorted(sorted_vals, x)
-    idx[idx == len(sorted_vals)] = 0
-    return sorted_vals[idx] == x
-
-
-def small_keys(keys: np.ndarray, max_block: int) -> np.ndarray:
-    """Sorted unique keys occurring at most max_block times."""
-    u, c = np.unique(keys, return_counts=True)
-    return u[c <= max_block]
-
-
-def make_keys(p: pd.DataFrame, dfs, chunk: int = 250_000, keep=None) -> pd.DataFrame:
-    """Return DataFrame(key uint64, row int32) for prepared records `p` (built in chunks).
-    If `keep` (sorted key array) is given, only those keys are kept - saves lots of RAM."""
-    parts = []
-    for lo in range(0, len(p), chunk):
-        k = _make_keys(p.iloc[lo:lo + chunk], dfs, lo)
-        if keep is not None:
-            k = k[isin_sorted(k["key"].values, keep)]
-        parts.append(k)
-    return pd.concat(parts, ignore_index=True)
-
-
-def _make_keys(p, dfs, offset):
-    name_df, skel_df, addr_df = dfs
+def make_keys(p: pd.DataFrame, name_df: Counter, addr_df: Counter) -> pd.DataFrame:
+    """Return DataFrame(key uint64, row int32) for prepared records `p`."""
     keys, rows = [], []
-    cols = [p[c].values for c in ("country", "name_core", "name_skel", "name_squash", "addr_sorted", "addr_nums")]
-    for i, (c, nc, sk, sq, asrt, nums) in enumerate(zip(*cols), offset):
+    for i, (c, nc, asrt, nums) in enumerate(zip(p["country"].values, p["name_core"].values,
+                                                 p["addr_sorted"].values, p["addr_nums"].values)):
         rn = _rare(nc.split(), name_df, 2)
-        rs = _rare(sk.split(), skel_df, 2)
         ns = _nums(nums)
-        street = _rare([t for t in asrt.split() if t.isalpha() and len(t) >= 3], addr_df, 2)
+        street = _rare([t for t in asrt.split() if t.isalpha()], addr_df, 1)
+        squash = "".join(nc.split())[:5]
         ks = []
-        if rn:
-            ks.append("a|" + c + "|" + "|".join(sorted(rn)))
-        if rs:
-            ks.append("e|" + c + "|" + "|".join(sorted(rs)))
-        if len(street) == 2:
-            ks.append(f"f|{c}|{street[0]}|{street[1]}")
-        if len(sq) >= 6:
-            ks.append(f"g|{c}|{sq[:10]}")
-        if len(sk) >= 4:
-            ks.append(f"n|{c}|{sk}")                    # whole phonetic name
-        if rn and street:
-            ks.append(f"i|{c}|{rn[0]}|{street[0]}")     # name word + street word (no house no.)
+        if len(rn) == 2:
+            ks.append(f"a|{c}|{rn[0]}|{rn[1]}")
+        elif len(rn) == 1:
+            ks.append(f"a|{c}|{rn[0]}")
         for n in ns:
             for t in rn:
                 ks.append(f"b|{c}|{t}|{n}")
-            if rs:
-                ks.append(f"h|{c}|{rs[0]}|{n}")
-            if street:
-                ks.append(f"c|{c}|{street[0]}|{n}")
-            if sq:
-                ks.append(f"d|{c}|{sq[:5]}|{n}")
+            for t in street:
+                ks.append(f"c|{c}|{t}|{n}")
+            if squash:
+                ks.append(f"d|{c}|{squash}|{n}")
         keys.extend(ks)
         rows.extend([i] * len(ks))
     h = pd.util.hash_array(np.asarray(keys, dtype=object), categorize=False)
     return pd.DataFrame({"key": h, "row": np.asarray(rows, dtype=np.int32)})
 
 
-def filter_keys(k1: pd.DataFrame, kt: pd.DataFrame, max_block: int = MAX_BLOCK, max_block_t=None):
+def filter_keys(k1: pd.DataFrame, kt: pd.DataFrame, max_block: int = MAX_BLOCK):
     """Keep only keys present on both sides with block size <= max_block."""
-    max_block_t = max_block if max_block_t is None else max_block_t
     vc_t = kt["key"].value_counts()
     vc_1 = k1["key"].value_counts()
-    ok = np.intersect1d(vc_t.index.values[vc_t.values <= max_block_t],
+    ok = np.intersect1d(vc_t.index.values[vc_t.values <= max_block],
                         vc_1.index.values[vc_1.values <= max_block])
     return (k1[np.isin(k1["key"].values, ok)].reset_index(drop=True),
             kt[np.isin(kt["key"].values, ok)].reset_index(drop=True))
